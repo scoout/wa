@@ -1,0 +1,56 @@
+{
+  "entities": {
+    "vault": {
+      "title": "Vault",
+      "description": "Storage for saved notes and files from WhatsApp",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "keyword": { "type": "string" },
+        "type": { "type": "string", "enum": ["note", "image", "video", "pdf", "other"] },
+        "content": { "type": "string", "description": "The text content or file URL" },
+        "fileName": { "type": "string" },
+        "sender": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "mimeType": { "type": "string" }
+      },
+      "required": ["type", "content", "sender", "timestamp", "keyword"]
+    },
+    "auth_data": {
+      "title": "Auth Data",
+      "description": "WhatsApp credentials data",
+      "type": "object",
+      "properties": {
+        "data": { "type": "string" }
+      }
+    },
+    "operational_report": {
+      "title": "Operational Report",
+      "description": "Daily or shift reports for powerhouse operations",
+      "type": "object",
+      "properties": {
+        "mw": { "type": "number", "description": "Megawatts output" },
+        "mvar": { "type": "number", "description": "Megavar output" },
+        "frequency": { "type": "number", "description": "System frequency in Hz" },
+        "unit": { "type": "string", "description": "Unit name or ID" },
+        "operator": { "type": "string", "description": "Name of the operator" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["mw", "mvar", "frequency", "operator", "timestamp"]
+    }
+  },
+  "firestore": {
+    "vault": {
+      "schema": "vault",
+      "description": "Collection of items saved to the digital vault"
+    },
+    "bot_sessions": {
+      "schema": "auth_data",
+      "description": "Storage for Baileys WhatsApp authentication session (creds and keys)"
+    },
+    "operational_reports": {
+      "schema": "operational_report",
+      "description": "Collection of powerhouse operational metric reports"
+    }
+  }
+}

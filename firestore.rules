@@ -1,0 +1,19 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Allow all for bot_sessions to rule out rules issues
+    match /bot_sessions/{document=**} {
+      allow read, write: if true;
+    }
+
+    // Operational reports
+    match /operational_reports/{document=**} {
+      allow read, write: if true;
+    }
+
+    // Catch-all (Deny others)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
