@@ -21,6 +21,7 @@
     "@types/multer": "^2.1.0",
     "@vitejs/plugin-react": "^5.0.4",
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "adm-zip": "^0.5.17",
     "axios": "^1.15.2",
     "cors": "^2.8.6",
     "dotenv": "^17.2.3",

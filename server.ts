@@ -24,6 +24,7 @@ import { GoogleGenAI } from "@google/genai";
 import cron from "node-cron";
 import stringSimilarity from "string-similarity";
 import multer from "multer";
+import AdmZip from "adm-zip";
 import { initializeApp, getApps, getApp, cert } from "firebase-admin/app";
 import { getFirestore, Firestore } from "firebase-admin/firestore";
 import { MongoClient, Db } from "mongodb";
@@ -54,16 +55,80 @@ let db_cloud: Firestore | null = null;
 let isCloudHealthy = true;
 let lastCloudErrorTime = 0;
 let rootSock: any = null;
+// --- GLOBAL CONFIGURATION ---
+const CONFIG_FILE = path.join(process.cwd(), "config.json");
+const ACTIVITIES_FILE = "activities.json";
+const STATUS_FILE = "status.json";
+const KEGIATAN_GROUP_ID = "120363351907221345@g.us";
+
+let targetSheetId: string = "1UUczN7BKH9Vecq8QjTx25fs1mdkl11PtHTdPE8es_n8";
+let targetGroupId: string = "120363344994495614@g.us";
+let adminNumber: string = "6285771373003";
+let botNumber: string = "6282337726122";
+let adminLid: string = "105931123757067";
+
 let currentConfig: any = {
-    adminNumber: "6285771373003",
-    targetGroupId: "120363344994495614@g.us"
+    adminNumber,
+    targetGroupId,
+    targetSheetId,
+    botNumber,
+    adminLid
 };
 const AUTH_COLLECTION = "bot_sessions"; 
 const sheetCache = new NodeCache({ stdTTL: 300, checkperiod: 60 }); 
 
+// --- MESSAGE QUEUE FOR RATE LIMITING ---
+class MessageQueue {
+    private queue: { jid: string, content: any, options?: any }[] = [];
+    private isProcessing = false;
+    private delayBetweenMessages = 2000; // 2 seconds base
+
+    async enqueue(jid: string, content: any, options?: any) {
+        this.queue.push({ jid, content, options });
+        this.process();
+    }
+
+    getQueueLength() {
+        return this.queue.length;
+    }
+
+    private async process() {
+        if (this.isProcessing || this.queue.length === 0) return;
+        this.isProcessing = true;
+
+        while (this.queue.length > 0) {
+            const item = this.queue.shift();
+            if (item && rootSock) {
+                // Add JITTER (Randomness) to avoid pattern detection
+                const jitter = Math.floor(Math.random() * 1000); 
+                await new Promise(resolve => setTimeout(resolve, this.delayBetweenMessages + jitter));
+
+                try {
+                    await rootSock.sendMessage(item.jid, item.content, item.options);
+                    addLog(`📤 [QUEUE] Sent message to ${item.jid}`);
+                } catch (e: any) {
+                    addLog(`❌ [QUEUE] Failed to send message to ${item.jid}: ${e.message}`);
+                }
+            }
+        }
+
+        this.isProcessing = false;
+    }
+}
+const messageQueue = new MessageQueue();
+
+// --- OPERATIONAL FAILURE TRACKING ---
+let continuousSheetFailures = 0;
+const FAILURE_THRESHOLD = 5;
+
+async function notifyFailureToAdmin(msg: string) {
+    const adminJid = `${currentConfig.adminNumber}@s.whatsapp.net`;
+    messageQueue.enqueue(adminJid, { text: `🚨 *SYSTEM ALERT*\n\n${msg}` });
+}
+
 function initFirebase() {
-    // If it was unhealthy, retry after 1 minute to avoid spamming
-    if (!isCloudHealthy && Date.now() - lastCloudErrorTime > 1 * 60 * 1000) {
+    // If it was unhealthy, retry after 30 seconds to avoid spamming but allow recovery
+    if (!isCloudHealthy && Date.now() - lastCloudErrorTime > 30 * 1000) {
         console.log(">>> [RELIABILITY] Retrying Firebase initialization...");
         isCloudHealthy = true;
     }
@@ -91,7 +156,19 @@ function initFirebase() {
         try {
             let options: any = { projectId: projId };
             
-            if (fs.existsSync(serviceAccountPath)) {
+            // Priority 1: Environment Variable (Safe for transient environments)
+            if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+                try {
+                    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+                    options.credential = cert(serviceAccount);
+                    options.projectId = serviceAccount.project_id || projId;
+                    console.log(`>>> [FIREBASE] AUTH: Using FIREBASE_SERVICE_ACCOUNT environment variable (Project: ${options.projectId})`);
+                } catch (e) {
+                    console.error(">>> [FIREBASE] AUTH ERROR: Failed to parse FIREBASE_SERVICE_ACCOUNT environment variable.");
+                }
+            } 
+            // Priority 2: Service Account File
+            else if (fs.existsSync(serviceAccountPath)) {
                 try {
                     const serviceAccount = JSON.parse(fs.readFileSync(serviceAccountPath, "utf-8"));
                     options.credential = cert(serviceAccount);
@@ -101,9 +178,7 @@ function initFirebase() {
                     console.error(">>> [FIREBASE] AUTH ERROR: Failed to parse service_account.json:", e);
                 }
             } else {
-                console.log(">>> [FIREBASE] AUTH: No service_account.json found. Using Default Cloud Identity (ADC).");
-                console.log(">>> [FIREBASE] AUTH: If you are connecting to an EXTERNAL project (like 'laporan-pembangkit'),");
-                console.log(">>> [FIREBASE] AUTH: you MUST upload 'service_account.json' to the root of this bot.");
+                console.log(">>> [FIREBASE] AUTH: No credentials found (File or Env). Using Default Cloud Identity (ADC).");
             }
 
             app = initializeApp(options);
@@ -214,11 +289,17 @@ async function useMongoAuthState() {
     const collection = db.collection(MONGO_AUTH_COLLECTION);
     const { initAuthCreds, BufferJSON } = await import("@whiskeysockets/baileys");
 
+    // In-memory cache
+    const memoryCache = new Map<string, any>();
+
     const readData = async (id: string) => {
         try {
+            if (memoryCache.has(id)) return memoryCache.get(id);
             const data = await collection.findOne({ _id: id as any });
             if (data && data.data) {
-                return JSON.parse(data.data as string, BufferJSON.reviver);
+                const parsed = JSON.parse(data.data as string, BufferJSON.reviver);
+                memoryCache.set(id, parsed);
+                return parsed;
             }
         } catch (e) {
             console.error(`[MONGO] Read Error [${id}]:`, e);
@@ -228,6 +309,7 @@ async function useMongoAuthState() {
 
     const writeData = async (data: any, id: string) => {
         try {
+            memoryCache.set(id, data);
             const json = JSON.stringify(data, BufferJSON.replacer);
             await collection.updateOne(
                 { _id: id as any },
@@ -241,6 +323,7 @@ async function useMongoAuthState() {
 
     const removeData = async (id: string) => {
         try {
+            memoryCache.delete(id);
             await collection.deleteOne({ _id: id as any });
         } catch (e) {
             console.error(`[MONGO] Delete Error [${id}]:`, e);
@@ -255,12 +338,30 @@ async function useMongoAuthState() {
             keys: {
                 get: async (type, ids) => {
                     const data: any = {};
-                    const mongoIds = ids.map(id => `${type}-${id}`);
+                    const fetchIds: string[] = [];
+
+                    for (const id of ids) {
+                        const key = `${type}-${id}`;
+                        if (memoryCache.has(key)) {
+                            // Hit cache
+                            const val = memoryCache.get(key);
+                            if (val) data[id] = val;
+                        } else {
+                            fetchIds.push(id);
+                        }
+                    }
+
+                    if (fetchIds.length === 0) return data;
+
+                    const mongoIds = fetchIds.map(id => `${type}-${id}`);
                     try {
                         const results = await collection.find({ _id: { $in: mongoIds as any } }).toArray();
                         results.forEach(res => {
-                            const id = res._id.toString().split("-").slice(1).join("-");
-                            data[id] = JSON.parse(res.data as string, BufferJSON.reviver);
+                            const fullId = res._id.toString();
+                            const id = fullId.split("-").slice(1).join("-");
+                            const parsed = JSON.parse(res.data as string, BufferJSON.reviver);
+                            data[id] = parsed;
+                            memoryCache.set(fullId, parsed);
                         });
                     } catch (e) {
                         console.error(`[MONGO] Keys Get Error [${type}]:`, e);
@@ -274,6 +375,7 @@ async function useMongoAuthState() {
                             const value = data[category][id];
                             const mongoId = `${category}-${id}`;
                             if (value) {
+                                memoryCache.set(mongoId, value);
                                 const json = JSON.stringify(value, BufferJSON.replacer);
                                 ops.push({
                                     updateOne: {
@@ -283,6 +385,7 @@ async function useMongoAuthState() {
                                     }
                                 });
                             } else {
+                                memoryCache.delete(mongoId);
                                 ops.push({
                                     deleteOne: {
                                         filter: { _id: mongoId as any }
@@ -332,36 +435,44 @@ async function useFirestoreAuthState() {
 
     const { initAuthCreds, BufferJSON } = await import("@whiskeysockets/baileys");
 
+    // In-memory cache to heavily reduce Cloud reads
+    const memoryCache = new Map<string, any>();
+
     const readData = async (key: string, retryCount = 0): Promise<any> => {
         try {
+            if (memoryCache.has(key)) return memoryCache.get(key);
+            
             if (!isCloudHealthy) return null;
             const fetchPromise = key === 'creds' ? credsDoc.get() : keysCollection.doc(key).get();
             
             const doc = await Promise.race([
                 fetchPromise,
-                new Promise((_, reject) => setTimeout(() => reject(new Error("TIMEOUT")), 10000))
+                new Promise((_, reject) => setTimeout(() => reject(new Error("TIMEOUT")), 15000))
             ]) as any;
 
-            if (!doc.exists) return null;
+            if (!doc || !doc.exists) return null;
             const data = doc.data()?.data;
             if (!data) return null;
 
-            return JSON.parse(data, BufferJSON.reviver);
+            const parsed = JSON.parse(data, BufferJSON.reviver);
+            memoryCache.set(key, parsed);
+            return parsed;
         } catch (e: any) {
-            if (e.message && e.message.includes("RESOURCE_EXHAUSTED")) {
+            const errMsg = e.message || String(e);
+            if (errMsg.includes("RESOURCE_EXHAUSTED")) {
                 isCloudHealthy = false;
                 addLog("🛑 [FIREBASE] Quota Exceeded. Switching to LOCAL-ONLY mode.");
                 return null;
             }
-            if ((e.message === "TIMEOUT" || e.message === "BATCH_TIMEOUT") && retryCount < 1) {
+            if ((errMsg === "TIMEOUT" || errMsg === "BATCH_TIMEOUT") && retryCount < 1) {
                 addLog(`🔄 [FIREBASE] Retrying read for [${key}] after timeout...`);
                 return readData(key, retryCount + 1);
             }
-            console.error(`Firebase Read Error [${key}]:`, e.message);
-            if (e.message === "TIMEOUT" || e.message === "BATCH_TIMEOUT") {
-                addLog(`⚠️ [FIREBASE] Read Timeout for [${key}] after retry. Check network or Cloud Region.`);
+            console.error(`Firebase Read Error [${key}]:`, errMsg);
+            if (errMsg === "TIMEOUT" || errMsg === "BATCH_TIMEOUT") {
+                addLog(`⚠️ [FIREBASE] Read Timeout for [${key}] after retry.`);
             }
-            if (e.message && e.message.includes("PERMISSION_DENIED")) {
+            if (errMsg.includes("PERMISSION_DENIED")) {
                 isCloudHealthy = false;
                 addLog("❌ [FIREBASE] PERMISSION_DENIED.");
             }
@@ -371,6 +482,7 @@ async function useFirestoreAuthState() {
 
     const writeData = async (data: any, key: string) => {
         try {
+            memoryCache.set(key, data);
             if (!isCloudHealthy) return;
             const json = JSON.stringify(data, BufferJSON.replacer);
             
@@ -391,6 +503,7 @@ async function useFirestoreAuthState() {
 
     const removeData = async (key: string) => {
         try {
+            memoryCache.delete(key);
             if (!isCloudHealthy) return;
             if (key === 'creds') {
                 await credsDoc.delete();
@@ -411,73 +524,121 @@ async function useFirestoreAuthState() {
             keys: {
                 get: async (type, ids) => {
                     const data: any = {};
-                    if (!isCloudHealthy || !ids || ids.length === 0) return data;
+                    const fetchIds: string[] = [];
 
-                    const performGet = async (attempt = 0): Promise<any> => {
-                        try {
-                            const docRefs = ids.map(id => keysCollection.doc(`${type}-${id}`));
-                            const snaps = await Promise.race([
-                                db.getAll(...docRefs),
-                                new Promise<any>((_, reject) => setTimeout(() => reject(new Error("BATCH_TIMEOUT")), 15000))
-                            ]);
-                            return snaps;
-                        } catch (e: any) {
-                            if (e.message === "BATCH_TIMEOUT" && attempt < 1) {
-                                addLog(`🔄 [FIREBASE] Retrying batch read for [${type}]...`);
-                                return performGet(attempt + 1);
-                            }
-                            throw e;
+                    for (const id of ids) {
+                        const key = `${type}-${id}`;
+                        if (memoryCache.has(key)) {
+                            // Hit cache
+                            const val = memoryCache.get(key);
+                            if (val) data[id] = val;
+                        } else {
+                            fetchIds.push(id);
                         }
-                    };
+                    }
 
-                    try {
-                        const snaps = await performGet();
-                        
-                        snaps.forEach((doc: any, index: number) => {
-                            if (doc.exists) {
-                                const id = ids[index];
-                                try {
-                                    const rawData = doc.data()?.data;
-                                    if (rawData) {
-                                        data[id] = JSON.parse(rawData, BufferJSON.reviver);
-                                    }
-                                } catch (e: any) {
-                                    console.error(`Parse Error for ${type}-${id}:`, e.message);
+                    if (!isCloudHealthy || fetchIds.length === 0) return data;
+
+                    // Chunking for getAll limit (1000) and stability
+                    const CHUNK_SIZE = 400;
+                    const chunks = [];
+                    for (let i = 0; i < fetchIds.length; i += CHUNK_SIZE) {
+                        chunks.push(fetchIds.slice(i, i + CHUNK_SIZE));
+                    }
+
+                    for (const chunk of chunks) {
+                        const performGet = async (attempt = 0): Promise<any> => {
+                            try {
+                                const docRefs = chunk.map(id => keysCollection.doc(`${type}-${id}`));
+                                const snaps = await Promise.race([
+                                    db.getAll(...docRefs),
+                                    new Promise<any>((_, reject) => setTimeout(() => reject(new Error("BATCH_TIMEOUT")), 20000))
+                                ]);
+                                return snaps;
+                            } catch (e: any) {
+                                if (e.message === "BATCH_TIMEOUT" && attempt < 1) {
+                                    addLog(`🔄 [FIREBASE] Retrying batch read for [${type} - ${chunk.length} keys]...`);
+                                    return performGet(attempt + 1);
                                 }
+                                throw e;
                             }
-                        });
-                    } catch (e: any) {
-                        console.error(`Firebase Batch Read Error [${type}]:`, e.message);
+                        };
+
+                        try {
+                            const snaps = await performGet();
+                            snaps.forEach((doc: any, index: number) => {
+                                if (doc && doc.exists) {
+                                    const id = chunk[index];
+                                    const cacheKey = `${type}-${id}`;
+                                    try {
+                                        const rawData = doc.data()?.data;
+                                        if (rawData) {
+                                            const parsed = JSON.parse(rawData, BufferJSON.reviver);
+                                            data[id] = parsed;
+                                            memoryCache.set(cacheKey, parsed);
+                                        }
+                                    } catch (parseErr: any) {
+                                        console.error(`Parse Error for ${cacheKey}:`, parseErr.message);
+                                    }
+                                }
+                            });
+                        } catch (e: any) {
+                            console.error(`Firebase Batch Read Error [${type}]:`, e.message);
+                            addLog(`⚠️ [FIREBASE] Batch Read Fail [${type}]: ${e.message}`);
+                        }
                     }
                     return data;
                 },
                 set: async (data: any) => {
-                    if (!isCloudHealthy) return;
-                    let batch = db.batch();
-                    let count = 0;
-                    
-                    for (const category in data) {
-                        for (const id in data[category]) {
-                            const value = data[category][id];
-                            const key = `${category}-${id}`;
-                            const docRef = (category === 'creds' && id === 'creds') ? credsDoc : keysCollection.doc(key);
-                            
-                            if (value) {
-                                const json = JSON.stringify(value, BufferJSON.replacer);
-                                batch.set(docRef, { data: json });
-                            } else {
-                                batch.delete(docRef);
-                            }
-                            count++;
-                            
-                            if (count >= 400) { // Safety margin
-                                await batch.commit();
-                                batch = db.batch();
-                                count = 0;
+                    try {
+                        let batch = db.batch();
+                        let count = 0;
+                        let hasData = false;
+                        
+                        for (const category in data) {
+                            for (const id in data[category]) {
+                                const value = data[category][id];
+                                const key = `${category}-${id}`;
+                                const docRef = (category === 'creds' && id === 'creds') ? credsDoc : keysCollection.doc(key);
+                                
+                                if (value) {
+                                    memoryCache.set(key, value);
+                                    if (isCloudHealthy) {
+                                        const json = JSON.stringify(value, BufferJSON.replacer);
+                                        batch.set(docRef, { data: json });
+                                        hasData = true;
+                                    }
+                                } else {
+                                    memoryCache.delete(key);
+                                    if (isCloudHealthy) {
+                                        batch.delete(docRef);
+                                        hasData = true;
+                                    }
+                                }
+                                count++;
+                                
+                                if (isCloudHealthy && count >= 450) { // Stay safely under 500 limit
+                                    await batch.commit().catch(err => {
+                                        console.error("Batch Commit Error (Chunk):", err.message);
+                                        throw err;
+                                    });
+                                    batch = db.batch();
+                                    count = 0;
+                                    hasData = false;
+                                }
                             }
                         }
+                        if (isCloudHealthy && hasData) {
+                            await batch.commit().catch(err => {
+                                console.error("Batch Commit Error (Final):", err.message);
+                                throw err;
+                            });
+                        }
+                    } catch (e: any) {
+                        console.error(`[FIREBASE] Keys Set Failure:`, e.message);
+                        addLog(`❌ [FIREBASE] Auth State persistence failed: ${e.message}`);
+                        if (e.message.includes("RESOURCE_EXHAUSTED")) isCloudHealthy = false;
                     }
-                    if (count > 0) await batch.commit();
                 }
             }
         },
@@ -537,11 +698,69 @@ function refreshMapping() {
 }
 refreshMapping();
 
+  async function restoreDataFromCloud() {
+    addLog("📥 [RESTORE] Mencoba memulihkan data dari Cloud...");
+    const db = initFirebase();
+    if (!db || !isCloudHealthy) {
+        addLog("⚠️ [RESTORE] Cloud Firestore tidak tersedia, melewati pemulihan.");
+        return;
+    }
+
+    try {
+        // 0. Restore Config
+        const configDoc = await db.collection("system_data").doc("config").get();
+        if (configDoc.exists) {
+            const cloudConfig = configDoc.data();
+            if (cloudConfig) {
+                targetSheetId = cloudConfig.targetSheetId || targetSheetId;
+                targetGroupId = cloudConfig.targetGroupId || targetGroupId;
+                adminNumber = cloudConfig.adminNumber || adminNumber;
+                botNumber = cloudConfig.botNumber || botNumber;
+                adminLid = cloudConfig.adminLid || adminLid;
+                currentConfig = { targetSheetId, targetGroupId, adminNumber, botNumber, adminLid };
+                fs.writeFileSync(CONFIG_FILE, JSON.stringify(cloudConfig, null, 2));
+                addLog("✅ [RESTORE] Konfigurasi sistem dipulihkan dari Cloud.");
+            }
+        }
+
+        // 1. Restore Status
+        const statusDoc = await db.collection("system_data").doc("status").get();
+        if (statusDoc.exists) {
+            const cloudStatus = statusDoc.data();
+            if (cloudStatus) {
+                fs.writeFileSync(STATUS_FILE, JSON.stringify(cloudStatus, null, 2));
+                addLog("✅ [RESTORE] Status berhasil dipulihkan dari Firestore.");
+            }
+        }
+
+        // 2. Restore Activities (Last 50)
+        const activitiesSnap = await db.collection("activities")
+            .orderBy("timestamp", "desc")
+            .limit(50)
+            .get();
+        
+        if (!activitiesSnap.empty) {
+            const cloudActivities = activitiesSnap.docs
+                .map(doc => {
+                    const data = doc.data();
+                    return { time: data.time, text: data.text };
+                })
+                .reverse(); // Back to chronological order
+            
+            fs.writeFileSync(ACTIVITIES_FILE, JSON.stringify(cloudActivities, null, 2));
+            addLog(`✅ [RESTORE] ${cloudActivities.length} Kegiatan terakhir dipulihkan.`);
+        }
+    } catch (e: any) {
+        addLog(`❌ [RESTORE] Gagal memulihkan data: ${e.message}`);
+    }
+  }
+restoreDataFromCloud();
+
 async function getAIResponse(prompt: string) {
   if (!ai) return "Maaf, fitur AI sedang tidak aktif (API Key belum diset).";
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview",
+      model: "gemini-3.5-flash",
       contents: prompt,
       config: {
           systemInstruction: "Anda adalah asisten bot WhatsApp untuk monitoring pembangkit listrik. Bantu menjawab pertanyaan operator dengan ramah dan sopan. Gunakan Bahasa Indonesia. Anda bisa membantu menjelaskan data teknis, cara kerja bot, atau hanya sekedar mengobrol santai."
@@ -559,13 +778,95 @@ async function getAIResponse(prompt: string) {
   }
 }
 
-// Google Sheets Setup
-const auth = new google.auth.GoogleAuth({
-  keyFile: "service_account.json",
-  scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-});
+const getGoogleAuth = () => {
+    const scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.file",
+        "https://www.googleapis.com/auth/drive"
+    ];
+    
+    // 1. Try environment variable secret (JSON string)
+    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+        try {
+            const credentials = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+            console.log(">>> [AUTH] Using FIREBASE_SERVICE_ACCOUNT environment variable for Google Auth.");
+            return new google.auth.GoogleAuth({ credentials, scopes });
+        } catch (e) {
+            console.error(">>> [AUTH] Failed to parse FIREBASE_SERVICE_ACCOUNT env var:", e);
+        }
+    }
 
+    // 2. Try physical file
+    const serviceAccountPath = "service_account.json";
+    if (fs.existsSync(serviceAccountPath)) {
+        try {
+            console.log(">>> [AUTH] Using service_account.json for Google Auth.");
+            return new google.auth.GoogleAuth({ keyFile: serviceAccountPath, scopes });
+        } catch (e) {
+            console.error(">>> [AUTH] Failed to read service_account.json:", e);
+        }
+    }
+
+    // 3. Fallback to ADC (Application Default Credentials)
+    console.log(">>> [AUTH] Falling back to Application Default Credentials (ADC) for Google Auth.");
+    return new google.auth.GoogleAuth({ scopes });
+};
+
+const auth = getGoogleAuth();
 const sheets = google.sheets({ version: "v4", auth });
+const drive = google.drive({ version: "v3", auth });
+
+async function uploadToDrive(fileName: string, filePath: string, mimeType: string) {
+    try {
+        const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
+        const fileMetadata = {
+            name: fileName,
+            parents: folderId ? [folderId] : []
+        };
+        const media = {
+            mimeType: mimeType,
+            body: fs.createReadStream(filePath)
+        };
+        const response = await drive.files.create({
+            requestBody: fileMetadata,
+            media: media as any,
+            fields: 'id, webViewLink'
+        });
+        
+        // --- NEW: Set Public Permissions ---
+        if (response.data.id) {
+            await drive.permissions.create({
+                fileId: response.data.id,
+                requestBody: {
+                    role: 'viewer',
+                    type: 'anyone',
+                },
+            });
+            console.log(">>> [DRIVE] Permissions set to PUBLIC for:", response.data.id);
+        }
+        
+        console.log(">>> [DRIVE] File uploaded successfully:", response.data.id);
+        return response.data;
+    } catch (error: any) {
+        console.error(">>> [DRIVE] Upload failed:", error.message);
+        return null;
+    }
+}
+
+function excelCellToIndices(cell: string): { colIdx: number, rowIdx: number } | null {
+  const match = cell.match(/^([A-Z]+)([0-9]+)$/i);
+  if (!match) return null;
+  const colStr = match[1].toUpperCase();
+  const rowStr = match[2];
+  
+  let colIdx = 0;
+  for (let i = 0; i < colStr.length; i++) {
+    colIdx = colIdx * 26 + (colStr.charCodeAt(i) - 64);
+  }
+  colIdx = colIdx - 1; // 0-based
+  const rowIdx = parseInt(rowStr, 10) - 1; // 0-based
+  return { colIdx, rowIdx };
+}
 
 async function updateSheetCell(spreadsheetId: string, day: number, column: string, row: number, value: string) {
   const range = `${day}!${column}${row}`;
@@ -585,11 +886,33 @@ async function updateSheetCell(spreadsheetId: string, day: number, column: strin
     // Update cache immediately on write
     sheetCache.set(cacheKey, value);
 
+    // Update the whole-sheet 2-D cache too if it exists
+    const fullSheetCacheKey = `fullsheet-${spreadsheetId}-${day}`;
+    const cachedSheetData: any[][] | undefined = sheetCache.get(fullSheetCacheKey);
+    if (cachedSheetData) {
+      const coord = excelCellToIndices(`${column}${row}`);
+      if (coord) {
+        while (cachedSheetData.length <= coord.rowIdx) {
+          cachedSheetData.push([]);
+        }
+        const rowData = cachedSheetData[coord.rowIdx];
+        while (rowData.length <= coord.colIdx) {
+          rowData.push("");
+        }
+        rowData[coord.colIdx] = value;
+        sheetCache.set(fullSheetCacheKey, cachedSheetData);
+      }
+    }
+
     console.log(`[SHEETS] Success: Updated ${range} in ${spreadsheetId} with value ${value}`);
     addLog(`✅ [SHEETS] Data disimpan ke Sheet ${day}, Kolom ${column}, Baris ${row}: ${value}`);
     return true;
   } catch (err: any) {
+    continuousSheetFailures++;
     const errMsg = err.message || String(err);
+    if (continuousSheetFailures >= FAILURE_THRESHOLD) {
+        notifyFailureToAdmin(`Terjadi ${continuousSheetFailures} kegagalan beruntun saat update Google Sheet.`);
+    }
     console.error(`[SHEETS] Error updating sheet at ${range}:`, errMsg);
     addLog(`❌ [SHEETS] Gagal simpan ke Sheet: ${errMsg}`);
     
@@ -622,10 +945,40 @@ async function notifyAdminSheetsFailure(sheetId: string) {
 }
 
 async function getCellValue(sheetId: string, sheetTitle: string, cellRange: string): Promise<string | null> {
+  const coord = excelCellToIndices(cellRange);
+  if (!coord) return null;
+
   const cacheKey = `cell-${sheetId}-${sheetTitle}-${cellRange}`;
   const cached = sheetCache.get(cacheKey);
   if (cached !== undefined) return cached as string;
 
+  // Check if we have the full sheet cached (reduces individual API calls drastically!)
+  const fullSheetCacheKey = `fullsheet-${sheetId}-${sheetTitle}`;
+  let cachedSheetData: any[][] | undefined = sheetCache.get(fullSheetCacheKey);
+
+  if (cachedSheetData === undefined) {
+    try {
+      console.log(`[SHEETS-CACHE] Full sheet cache miss for day ${sheetTitle}. Fetching range A1:Z150...`);
+      const response = await sheets.spreadsheets.values.get({
+        spreadsheetId: sheetId,
+        range: `${sheetTitle}!A1:Z150`,
+      });
+      cachedSheetData = response.data.values || [];
+      sheetCache.set(fullSheetCacheKey, cachedSheetData);
+      console.log(`[SHEETS-CACHE] Cached entire sheet ${sheetTitle} with ${cachedSheetData.length} rows.`);
+    } catch (err: any) {
+      console.error(`[SHEETS-CACHE] Error preloading sheet ${sheetTitle}:`, err.message || err);
+    }
+  }
+
+  if (cachedSheetData !== undefined) {
+    const rowValues = cachedSheetData[coord.rowIdx];
+    const result = (rowValues && rowValues[coord.colIdx] !== undefined) ? String(rowValues[coord.colIdx]) : "";
+    sheetCache.set(cacheKey, result);
+    return result;
+  }
+
+  // Absolute fallback: direct single-cell API fetch
   try {
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId: sheetId,
@@ -747,14 +1100,64 @@ async function startServer() {
   });
   const upload = multer({ storage });
 
-  app.get("/api/vault", async (req, res) => {
+  app.get("/api/vault/download/:id", async (req, res) => {
+    const { id } = req.params;
     if (!db_cloud) initFirebase();
     if (!db_cloud) return res.status(500).json({ error: "Firebase not initialized" });
+
     try {
-      const snapshot = await db_cloud.collection("vault").orderBy("timestamp", "desc").limit(100).get();
+      const doc = await db_cloud.collection("vault").doc(id).get();
+      if (!doc.exists) return res.status(404).send("File not found in database");
+      
+      const data = doc.data();
+      if (!data) return res.status(404).send("No data found");
+
+      const localPath = path.join(process.cwd(), "uploads", data.path);
+      
+      // Try local file first
+      if (fs.existsSync(localPath)) {
+        res.setHeader('Content-Disposition', `attachment; filename="${data.filename}"`);
+        return res.sendFile(localPath);
+      }
+
+      // If local file missing but Drive link exists, stream from Drive
+      if (data.driveId) {
+        addLog(`☁️ [DRIVE] Streaming missing local file from Drive: ${data.filename}`);
+        const driveResponse = await drive.files.get(
+          { fileId: data.driveId, alt: 'media' },
+          { responseType: 'stream' }
+        );
+
+        res.setHeader('Content-Type', data.type || 'application/octet-stream');
+        res.setHeader('Content-Disposition', `attachment; filename="${data.filename}"`);
+        
+        driveResponse.data
+          .on('error', (err: any) => {
+             console.error("Drive stream error:", err);
+             res.status(500).send("Error streaming from Drive");
+          })
+          .pipe(res);
+        return;
+      }
+
+      res.status(404).send("File not available locally or on Drive");
+    } catch (err: any) {
+        console.error("Download proxy error:", err.message);
+        res.status(500).send("Error processing download");
+    }
+  });
+
+  app.get("/api/vault", async (req, res) => {
+    const db = initFirebase();
+    if (!db || !isCloudHealthy) {
+        return res.json([]); // Return empty array to keep UI alive
+    }
+    try {
+      const snapshot = await db.collection("vault").orderBy("timestamp", "desc").limit(100).get();
       const items = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       res.json(items);
-    } catch (err) {
+    } catch (err: any) {
+      console.error("Vault fetch error:", err.message);
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
@@ -765,7 +1168,7 @@ async function startServer() {
     if (!db_cloud) return res.status(500).json({ error: "Firebase not initialized" });
 
     try {
-      const newItem = {
+      const newItem: any = {
         filename: req.file.originalname,
         path: req.file.filename,
         type: req.file.mimetype,
@@ -773,6 +1176,13 @@ async function startServer() {
         sender: "Dashboard Upload",
         size: req.file.size
       };
+
+      // --- DRIVE SYNC ---
+      const driveFile: any = await uploadToDrive(req.file.originalname, req.file.path, req.file.mimetype);
+      if (driveFile && driveFile.webViewLink) {
+        newItem.driveLink = driveFile.webViewLink;
+        newItem.driveId = driveFile.id;
+      }
 
       const docRef = await db_cloud.collection("vault").add(newItem);
       res.json({ id: docRef.id, ...newItem });
@@ -885,17 +1295,8 @@ async function startServer() {
     io.emit("bot:statusMessage", statusMessage);
     if (msg) addLog(`[STATUS] ${status.toUpperCase()}: ${msg}`);
   };
-  const CONFIG_FILE = path.join(process.cwd(), "config.json");
-  let targetSheetId: string = "1UUczN7BKH9Vecq8QjTx25fs1mdkl11PtHTdPE8es_n8";
-  let targetGroupId: string = "120363344994495614@g.us";
-  let adminNumber: string = "6285771373003";
-  let botNumber: string = "6282337726122";
-  let adminLid: string = "105931123757067";
-  const KEGIATAN_GROUP_ID = "120363351907221345@g.us";
-  const ACTIVITIES_FILE = "activities.json";
-  const STATUS_FILE = "status.json";
 
-function getStatus(): Record<string, string> {
+  function getStatus(): Record<string, string> {
     try {
       if (fs.existsSync(STATUS_FILE)) {
         return JSON.parse(fs.readFileSync(STATUS_FILE, "utf-8"));
@@ -906,11 +1307,22 @@ function getStatus(): Record<string, string> {
     return {};
   }
 
-  function updateStatus(updates: Record<string, string>) {
+  async function updateStatus(updates: Record<string, string>) {
     try {
       const status = getStatus();
       const newStatus = { ...status, ...updates };
       fs.writeFileSync(STATUS_FILE, JSON.stringify(newStatus, null, 2));
+      
+      // Mirror to Cloud
+      const db = initFirebase();
+      if (db && isCloudHealthy) {
+          try {
+              await db.collection("system_data").doc("status").set(newStatus);
+              addLog("☁️ [CLOUD] Status synced to Firestore.");
+          } catch (e) {
+              console.warn("Failed to sync status to firestore:", e);
+          }
+      }
     } catch (e) {
       console.error("Error updating status:", e);
     }
@@ -932,12 +1344,29 @@ function getStatus(): Record<string, string> {
     return [];
   }
 
-  function saveActivity(text: string, time?: string) {
+  async function saveActivity(text: string, time?: string) {
     try {
       const activities = getActivities();
       const activityTime = time || getJakartaTime().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', hour12: false }).replace(':', '.');
-      activities.push({ time: activityTime, text });
-      fs.writeFileSync(ACTIVITIES_FILE, JSON.stringify(activities, null, 2));
+      const newActivity = { time: activityTime, text };
+      activities.push(newActivity);
+      
+      // Keep only last 100 activities locally to avoid massive files
+      const limitedActivities = activities.slice(-100);
+      fs.writeFileSync(ACTIVITIES_FILE, JSON.stringify(limitedActivities, null, 2));
+      
+      // Mirror to Cloud
+      const db = initFirebase();
+      if (db && isCloudHealthy) {
+          try {
+              await db.collection("activities").add({
+                  ...newActivity,
+                  timestamp: new Date()
+              });
+          } catch (e) {
+              console.warn("Failed to sync activity to firestore:", e);
+          }
+      }
     } catch (e) {
       console.error("Error saving activity:", e);
     }
@@ -1197,15 +1626,27 @@ Level Siphon : - cm
         adminLid = data.adminLid || adminLid;
         currentConfig = { targetSheetId, targetGroupId, adminNumber, botNumber, adminLid };
         console.log("Config loaded from file");
+      } else {
+        const configData = { targetSheetId, targetGroupId, adminNumber, botNumber, adminLid };
+        fs.writeFileSync(CONFIG_FILE, JSON.stringify(configData, null, 2));
+        console.log("Config file created with default values");
       }
     } catch (e) {
       console.log("Error loading config:", e);
     }
   }
 
-  function saveConfig() {
+  async function saveConfig() {
     try {
-      fs.writeFileSync(CONFIG_FILE, JSON.stringify({ targetSheetId, targetGroupId, adminNumber, adminLid }, null, 2));
+      const configData = { targetSheetId, targetGroupId, adminNumber, botNumber, adminLid };
+      fs.writeFileSync(CONFIG_FILE, JSON.stringify(configData, null, 2));
+      
+      // Sync to cloud
+      const db = initFirebase();
+      if (db && isCloudHealthy) {
+          await db.collection("system_data").doc("config").set(configData);
+          addLog("☁️ [CLOUD] Configuration synced to Firestore.");
+      }
     } catch (e) {
       console.log("Error saving config:", e);
     }
@@ -1235,16 +1676,28 @@ Level Siphon : - cm
 
   app.get("/api/api-status", (req, res) => {
     try {
-        const sa = JSON.parse(fs.readFileSync("service_account.json", "utf-8"));
+        let saEmail = "Not Configured";
+        if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+            try {
+                const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+                saEmail = sa.client_email;
+            } catch (e) {}
+        } else if (fs.existsSync("service_account.json")) {
+            try {
+                const sa = JSON.parse(fs.readFileSync("service_account.json", "utf-8"));
+                saEmail = sa.client_email;
+            } catch (e) {}
+        }
+
         res.json({
             gemini: !!process.env.GEMINI_API_KEY,
             spreadsheetId: targetSheetId,
-            serviceAccountEmail: sa.client_email,
+            serviceAccountEmail: saEmail,
             cloudHealthy: isCloudHealthy,
             whatsappStatus: connectionStatus
         });
     } catch (e) {
-        res.status(500).json({ error: "Failed to read service account" });
+        res.status(500).json({ error: "Failed to gather API status" });
     }
   });
 
@@ -1282,14 +1735,120 @@ Level Siphon : - cm
   };
 
   /**
+   * Helper: Menentukan apakah sebuah alias/nilai historis merupakan counter akumulatif (misal MWh, UAT, Gas totalizers).
+   * Counter akumulatif nilainya selalu naik (monotonik naik) dan bertambah sedikit demi sedikit.
+   */
+  function isCumulativeCounter(alias: string, lastNum: number): boolean {
+      const lower = alias.toLowerCase().trim();
+      const counterKeywords = ["mwh", "uat", "gas_lokal", "gas lokal", "cr gtg", "control room", "sst", "counter", "stand", "stg", "gtg"];
+      
+      if (counterKeywords.some(keyword => lower.includes(keyword))) {
+          // Kecualikan parameter instan yang memiliki nama unit di dalamnya (misalnya suhu, tekanan, vibrasi)
+          if (lower.includes("press") || lower.includes("temp") || lower.includes("vib") || lower.includes("level") || lower.includes("arus") || lower.includes("h2") || lower.includes("hypo") || lower.includes("demin")) {
+              return false;
+          }
+          return true;
+      }
+      
+      // Heuristic: Nilai yang sangat besar (> 400) hampir pasti merupakan accumulator, kecuali jika namanya mengandung penunjuk suhu
+      if (lastNum > 400) {
+          if (lower.includes("temp") || lower.includes("suhu") || lower.includes("derajat")) {
+              return false;
+          }
+          return true;
+      }
+      
+      return false;
+  }
+
+  /**
+   * Helper: Mencari alias terdekat berdasarkan nilai/angka historis terkini
+   */
+  function findClosestAliasByValue(providedValue: string): { alias: string, row: number, diff: number } | null {
+      if (!providedValue) return null;
+      const cleanValue = providedValue.replace(/,/g, "").split("/")[0].trim();
+      const valNum = parseFloat(cleanValue);
+      if (isNaN(valNum) || valNum <= 0) return null;
+
+      const status = getStatus();
+      let bestAlias: string | null = null;
+      let minDiff = Infinity;
+
+      Object.entries(status).forEach(([alias, lastVal]) => {
+          const lastNum = parseFloat(String(lastVal).replace(/,/g, "").split("/")[0]);
+          if (!isNaN(lastNum) && lastNum > 0) {
+              const lowerAlias = alias.toLowerCase().trim();
+              const row = ROW_MAP[lowerAlias];
+              if (!row) return; // Hanya bandingkan dengan alias yang aktif ter-mapping di sheet!
+
+              const isCounter = isCumulativeCounter(alias, lastNum);
+              let diff = Infinity;
+
+              if (isCounter) {
+                  // Aturan pintar: Counter akumulatif tidak boleh turun. Harus lebih besar atau sama (toleransi koreksi manual 0.5)
+                  if (valNum >= lastNum - 0.5) {
+                      diff = (valNum - lastNum) / lastNum;
+                      if (diff < 0) diff = Math.abs(diff); // Toleransi koreksi kecil
+                  }
+              } else {
+                  // Parameter biasa: Nilai absolut selisih relatif
+                  diff = Math.abs(valNum - lastNum) / lastNum;
+              }
+
+              if (diff < minDiff) {
+                  minDiff = diff;
+                  bestAlias = alias;
+              }
+          }
+      });
+
+      // Verifikasi kecocokan berdasarkan threshold toleransi penambahan/perubahan
+      if (bestAlias) {
+          const lastVal = status[bestAlias];
+          const lastNum = parseFloat(String(lastVal).replace(/,/g, "").split("/")[0]);
+          const isCounter = isCumulativeCounter(bestAlias, lastNum);
+          
+          const maxAllowedTolerance = isCounter ? 0.20 : 0.15; // Toleransi penambahan max 20% untuk counter, 15% untuk parameter dinamis
+          if (minDiff < maxAllowedTolerance) {
+              const row = ROW_MAP[bestAlias.toLowerCase().trim()];
+              if (row) {
+                  return {
+                      alias: bestAlias,
+                      row,
+                      diff: minDiff
+                  };
+              }
+          }
+      }
+      return null;
+  }
+
+  /**
    * Fuzzy Matching: Mencari alias terdekat dari ROW_MAP jika input tidak pas.
    * Sekarang juga mempertimbangkan nilai (historical value) untuk disambiguasi.
    */
   function findBestAlias(input: string, providedValue?: string): { alias: string, row: number, score: number } | null {
+      const lowerInput = input.toLowerCase().trim();
+      const cleanLowerInput = lowerInput.replace(/[:.]/g, "").trim();
+      const GENERIC_ALIASES = ["mwh", "counter", "stand", "stand meter", "cnt", "nilai", "angka", "data", "val", "kounter", "standmeter", "stnd"];
+      
+      // Jika input adalah kata yang sangat umum/generik, abaikan similarity string dan cari berdasarkan value history langsung!
+      if (providedValue && (GENERIC_ALIASES.includes(cleanLowerInput) || cleanLowerInput === "")) {
+          const closest = findClosestAliasByValue(providedValue);
+          if (closest) {
+              addLog(`🧠 Smart Value Match for generic input [${input}] -> [${closest.alias}] (Diff: ${(closest.diff * 100).toFixed(2)}%)`);
+              return {
+                  alias: closest.alias,
+                  row: closest.row,
+                  score: 1.0 // Sempurna / Masuk prioritas tertinggi karena berdasarkan verifikasi angka fisik
+              };
+          }
+      }
+
       const aliases = Object.keys(ROW_MAP);
       if (aliases.length === 0) return null;
       
-      const matches = stringSimilarity.findBestMatch(input.toLowerCase(), aliases);
+      const matches = stringSimilarity.findBestMatch(lowerInput, aliases);
       
       // Ambil top 5 candidate yang ratingnya lumayan (> 0.45)
       const topMatches = matches.ratings
@@ -1297,9 +1856,23 @@ Level Siphon : - cm
           .sort((a, b) => b.rating - a.rating)
           .slice(0, 5);
 
-      if (topMatches.length === 0) return null;
+      if (topMatches.length === 0) {
+          // Fallback cerdas: Jika kemiripan string nol tapi ada value logis, cari berdasarkan history value global (seluruh tabel)
+          if (providedValue) {
+              const closest = findClosestAliasByValue(providedValue);
+              if (closest) {
+                  addLog(`🧠 Best Value Match fallback [${input}] -> [${closest.alias}] (Diff: ${(closest.diff * 100).toFixed(2)}%)`);
+                  return {
+                      alias: closest.alias,
+                      row: closest.row,
+                      score: 0.8
+                  };
+              }
+          }
+          return null;
+      }
 
-      // Jika ada value, coba validasi dengan history (Memory Match)
+      // Jika ada value, coba validasi dengan history (Memory Match) di antara top candidates
       if (providedValue) {
           const valNum = parseFloat(providedValue.replace(/,/g, ""));
           if (!isNaN(valNum)) {
@@ -1311,9 +1884,19 @@ Level Siphon : - cm
                   const lastVal = status[match.target];
                   if (lastVal) {
                       const lastNum = parseFloat(String(lastVal).replace(/,/g, ""));
-                      // Jika lastNum adalah 0 atau string "0", kita skip atau perlakukan beda
                       if (lastNum > 0) {
-                          const diff = Math.abs(valNum - lastNum) / lastNum;
+                          const isCounter = isCumulativeCounter(match.target, lastNum);
+                          let diff = Infinity;
+                          
+                          if (isCounter) {
+                              if (valNum >= lastNum - 0.5) {
+                                  diff = (valNum - lastNum) / lastNum;
+                                  if (diff < 0) diff = Math.abs(diff);
+                              }
+                          } else {
+                              diff = Math.abs(valNum - lastNum) / lastNum;
+                          }
+                          
                           if (diff < minDiff) {
                               minDiff = diff;
                               bestByValue = match;
@@ -1322,15 +1905,21 @@ Level Siphon : - cm
                   }
               }
 
-              // Jika ada yang selisihnya sangat kecil (< 10%) DAN alias match score-nya masih masuk akal
-              // Kita ambil itu sebagai pemenang walaupun bukan top alias score.
-              if (bestByValue && minDiff < 0.10 && bestByValue.rating > 0.45) {
-                   addLog(`✨ Disambiguation: Historical value match found for [${input}] -> [${bestByValue.target}] (Diff: ${(minDiff*100).toFixed(1)}%)`);
-                   return {
-                       alias: bestByValue.target,
-                       row: ROW_MAP[bestByValue.target],
-                       score: bestByValue.rating
-                   };
+              // Jika ada kandidat terdekat yang selisih nilainya masuk akal (< 15% untuk parameter, < 20% untuk counter)
+              if (bestByValue) {
+                  const targetLastVal = status[bestByValue.target];
+                  const targetLastNum = parseFloat(String(targetLastVal).replace(/,/g, ""));
+                  const isCounter = isCumulativeCounter(bestByValue.target, targetLastNum);
+                  const maxAllowed = isCounter ? 0.20 : 0.15;
+                  
+                  if (minDiff < maxAllowed && bestByValue.rating > 0.45) {
+                       addLog(`✨ Disambiguation: Historical value match found for [${input}] -> [${bestByValue.target}] (Diff: ${(minDiff*100).toFixed(1)}%)`);
+                       return {
+                           alias: bestByValue.target,
+                           row: ROW_MAP[bestByValue.target],
+                           score: bestByValue.rating + 0.2 // Beri bonus score
+                       };
+                  }
               }
           }
       }
@@ -1340,11 +1929,30 @@ Level Siphon : - cm
       if (bestMatch.rating > 0.6) {
           return {
               alias: bestMatch.target,
-              row: ROW_MAP[bestMatch.target],
+              row: BEST_MATCH_VAL_ROW(bestMatch.target),
               score: bestMatch.rating
           };
       }
+
+      // Jika kemiripan string rendah tapi ada value logis, gunakan fallback global value
+      if (providedValue) {
+          const closest = findClosestAliasByValue(providedValue);
+          if (closest) {
+              addLog(`🧠 Best Value Match fallback low similarity [${input}] -> [${closest.alias}] (Diff: ${(closest.diff * 100).toFixed(2)}%)`);
+              return {
+                  alias: closest.alias,
+                  row: closest.row,
+                  score: 0.7
+              };
+          }
+      }
+
       return null;
+  }
+
+  // Helper local function to get row safely
+  function BEST_MATCH_VAL_ROW(target: string): number {
+      return ROW_MAP[target] || 0;
   }
 
   /**
@@ -1412,6 +2020,9 @@ Level Siphon : - cm
   async function syncStatusFromSheet() {
       addLog("🔄 [SYNC] Memulai sinkronisasi data dari Google Sheet...");
       try {
+          // Purge sheet cache to make sure we sync with fresh data
+          sheetCache.flushAll();
+          
           const now = getJakartaTime();
           const daysToTry = [now.getDate()]; 
           const yesterday = new Date(now);
@@ -1430,6 +2041,7 @@ Level Siphon : - cm
                   });
 
                   const rows = response.data.values;
+                  continuousSheetFailures = 0; // Reset on success
                   if (!rows || rows.length === 0) continue;
 
                   Object.entries(ROW_MAP).forEach(([alias, rowNum]) => {
@@ -1654,8 +2266,6 @@ async function connectToWhatsApp() {
         defaultQueryTimeoutMs: 30000, // Reduced from 60s
         keepAliveIntervalMs: 15000, 
         retryRequestDelayMs: 2000,
-        maxRetries: 5,
-        linkPreview: false, // Faster sending
         shouldSyncHistoryMessage: () => false, 
         msgRetryCounterCache, 
         getMessage: async (key) => {
@@ -1703,14 +2313,22 @@ async function connectToWhatsApp() {
 
           const isQRTimeout = error?.message?.includes("QR refs attempts ended");
           const isPairingFailed = error?.message?.includes("Pairing with number failed") || error?.message?.includes("Gagal menautkan");
-          const isSyncOrPatchError = error?.message?.includes("failed to sync state") || error?.message?.includes("decode patch") || error?.message?.includes("failed to find key");
+          const isSyncOrPatchError = error?.message?.includes("failed to sync state") || error?.message?.includes("decode patch") || error?.message?.includes("failed to find key") || error?.message?.includes("PreKeyError") || error?.message?.includes("failed to decrypt");
           
           if (isQRTimeout || isSyncOrPatchError) {
               consecutive428Count++; // Reuse counter
-              const errType = isQRTimeout ? "QR Timeout" : "Sync/Patch Corruption";
+              const errType = isQRTimeout ? "QR Timeout" : "Sync/Auth Corruption";
               addLog(`⚠️ [RELIABILITY] ${errType} detected [Attempt ${consecutive428Count}/2]`);
-              if (consecutive428Count >= 2 || isSyncOrPatchError) {
-                  addLog("🚨 [CRITICAL] Persistent Error or Session Corruption. Clearing session to force fresh state...");
+              
+              if (isSyncOrPatchError) {
+                  addLog("🚨 [CRITICAL] Decryption/Sync Error! This often means session is corrupted. Clearing state in 3s...");
+                  isConnecting = false;
+                  setTimeout(() => clearCloudSession().then(() => connectToWhatsApp()), 3000);
+                  return;
+              }
+
+              if (consecutive428Count >= 2) {
+                  addLog("🚨 [CRITICAL] Persistent QR Timeout. Clearing session to force fresh state...");
                   await clearCloudSession();
                   consecutive428Count = 0;
               }
@@ -1799,6 +2417,11 @@ async function connectToWhatsApp() {
           addLog("✅ Gateway Protocol: OPTIMAL - Secure link established.");
           qrCode = null;
           syncStatusFromSheet().catch(err => addLog(`⚠️ [SYNC] Background sync failed: ${err.message}`));
+          
+          // Notify Admin on Startup
+          const adminJid = `${adminNumber}@s.whatsapp.net`;
+          const bootMsg = `🚀 *BOT ONLINE*\n\nSistem telah berhasil aktif kembali pada ${new Date().toLocaleString("id-ID")}.\n\n_Mode Persistence: ${isCloudHealthy ? 'Cloud Persistent' : 'Local Only'}_`;
+          messageQueue.enqueue(adminJid, { text: bootMsg });
         }
       });
     } catch (err: any) {
@@ -1830,6 +2453,14 @@ async function connectToWhatsApp() {
               
               const isQuoted = !!message?.extendedTextMessage?.contextInfo?.quotedMessage;
               const quotedMsg = message?.extendedTextMessage?.contextInfo?.quotedMessage;
+              let quotedText = "";
+              if (isQuoted && quotedMsg) {
+                  quotedText = quotedMsg.conversation || 
+                               quotedMsg.extendedTextMessage?.text || 
+                               quotedMsg.imageMessage?.caption || 
+                               quotedMsg.videoMessage?.caption || 
+                               quotedMsg.documentMessage?.caption || "";
+              }
               const messageType = Object.keys(message || {})[0];
 
               if (!rawJid) continue;
@@ -1837,10 +2468,10 @@ async function connectToWhatsApp() {
               // Skip self messages or status messages
               if (rawJid === "status@broadcast") continue;
 
-              // Immediate reaction to show the bot is working (Responsiveness)
-              if (!isQuoted && !text.startsWith("!") && text.length > 2) {
-                  await sock.sendMessage(rawJid, { react: { text: "⏳", key: msg.key } }).catch(() => {});
-              }
+            // Immediate reaction to show the bot is working (Responsiveness)
+            if (!isQuoted && !text.startsWith("!") && text.length > 2) {
+                sock.sendMessage(rawJid, { react: { text: "⏳", key: msg.key } }).catch(() => {});
+            }
 
               addLog(`📢 [MSG] Incoming from ${rawJid} (${messageType}): ${text.slice(0, 100)}`);
 
@@ -1861,8 +2492,12 @@ async function connectToWhatsApp() {
             const isActivityGroup = (senderJid === KEGIATAN_GROUP_ID);
             const isAllowedAdminPrivate = (isPrivateChat && isFromAdmin);
             const lowerText = text.toLowerCase().trim();
-
-            // --- FITUR LAPOR OPERASIONAL (MW, MVAR, FREK) ---
+            
+            // --- FITUR USER-FRIENDLY (P, MENU) ---
+            if (lowerText === "p" || lowerText === "ping") {
+                await sock.sendMessage(senderJid, { text: "Halo Pak! 👋 Ada yang bisa saya bantu?\n\nKetik *menu* untuk melihat daftar perintah." });
+                return;
+            }
             if (lowerText.startsWith("!lapor")) {
                 const parts = lowerText.split(/\s+/);
                 if (parts.length >= 5) {
@@ -1917,9 +2552,13 @@ async function connectToWhatsApp() {
                 if (isFromAdmin) {
                     menu += `⚙️ *Admin Commands:*\n`;
                     menu += `• \`!sync\`: Sinkron data dari Sheets\n`;
+                    menu += `• \`!map list\`: Lihat mapping baris\n`;
                     menu += `• \`!map <alias> <row>\`: Edit mapping baris\n`;
+                    menu += `• \`!clearlog\`: Bersihkan log dashboard\n`;
                     menu += `• \`!restart\`: Mulai ulang bot\n`;
-                    menu += `• \`!stats\`: Statistik bot\n`;
+                    menu += `• \`!backup\`: Download source code (.zip)\n`;
+                    menu += `• \`!debug\`: Dump internal state\n`;
+                    menu += `• \`!status\`: Dashboard system\n`;
                 }
                 
                 await sock.sendMessage(senderJid, { text: menu });
@@ -1943,25 +2582,32 @@ async function connectToWhatsApp() {
             }
 
             // --- PERINTAH STATUS ---
-            if (lowerText === "!status" || lowerText === "!ping") {
+            if (lowerText === "!status" || lowerText === "!ping" || lowerText === "status") {
                 const uptime = process.uptime();
                 const days = Math.floor(uptime / (3600 * 24));
                 const hours = Math.floor((uptime % (3600 * 24)) / 3600);
                 const minutes = Math.floor((uptime % 3600) / 60);
                 
-                const mongoStatus = (isMongoHealthy && mongo_db) ? "✅" : "❌";
-                const fireStatus = (isCloudHealthy && db_cloud) ? "✅" : "❌";
-                const cloudStatus = `${mongoStatus} (Mongo) / ${fireStatus} (Firestore)`;
+                const memory = process.memoryUsage();
+                const ramUsed = Math.round(memory.heapUsed / 1024 / 1024);
                 
-                const waStatus = (connectionStatus === "open") ? "✅ CONNECTED (STABLE)" : "⚠️ " + (connectionStatus || "DISCONNECTED").toUpperCase();
+                const mongoStatus = (isMongoHealthy && mongo_db) ? "🟢" : "🔴";
+                const fireStatus = (isCloudHealthy && db_cloud) ? "🟢" : "🔴";
+                const aiStatus = ai ? "🟢" : "🔴";
                 
-                const msg = `*[ 🛡️ BOT ENGINE STATUS ]*\n\n` +
-                            `🟢 Status: ${waStatus}\n` +
-                            `⏳ Uptime: ${days > 0 ? days + "d " : ""}${hours}h ${minutes}m\n` +
-                            `☁️ Cloud Sync: ${cloudStatus}\n` +
-                            `💓 Heartbeat: Active (Every 2m)\n` +
-                            `🔧 Self-Healing: Enabled\n\n` +
-                            `_Bot ini dirancang untuk tetap online 24 jam dengan sistem pemulihan otomatis._`;
+                const waStatus = (connectionStatus === "open") ? "🟢 TERHUBUNG" : "🔴 " + (connectionStatus || "OFFLINE").toUpperCase();
+                
+                const msg = `*[ 🛡️ BOT SYSTEM DASHBOARD ]*\n\n` +
+                            `📱 *Koneksi WhatsApp:* ${waStatus}\n` +
+                            `☁️ *Database Firestore:* ${fireStatus}\n` +
+                            `📊 *Database MongoDB:* ${mongoStatus}\n` +
+                            `🤖 *AI Engine (Gemini):* ${aiStatus}\n\n` +
+                            `⚙️ *Server Info:*\n` +
+                            `• Uptime: ${days > 0 ? days + "d " : ""}${hours}h ${minutes}m\n` +
+                            `• Memori: ${ramUsed} MB\n` +
+                            `• TZ: ${process.env.TZ}\n` +
+                            `• Heartbeat: Active (Every 2m)\n\n` +
+                            `_Bot berjalan secara otomatis dan dipantau sistem self-healing._`;
                 await sock.sendMessage(senderJid, { text: msg });
                 continue;
             }
@@ -2118,12 +2764,20 @@ async function connectToWhatsApp() {
                         const filePath = path.join(process.cwd(), "uploads", fileName);
                         fs.writeFileSync(filePath, buffer);
                         
+                        // --- GOOGLE DRIVE INTEGRATION ---
+                        addLog(`☁️ [DRIVE] Uploading ${fileName} to Google Drive...`);
+                        const driveFile: any = await uploadToDrive(fileName, filePath, mimeType);
+                        
                         const baseUrl = process.env.APP_URL || "";
-                        if (baseUrl) {
+                        if (driveFile && driveFile.webViewLink) {
+                            content = driveFile.webViewLink;
+                            addLog(`✅ [DRIVE] Media synced to Drive: ${driveFile.id}`);
+                        } else if (baseUrl) {
                             content = `${baseUrl}/uploads/${fileName}`;
                         } else {
                             content = `(File saved locally: ${fileName})`;
                         }
+                        
                         addLog(`✅ Media saved to vault: ${fileName}`);
                     }
 
@@ -2232,13 +2886,30 @@ async function connectToWhatsApp() {
 
             if (lowerText === "!listnote" || lowerText === "!vault") {
                 const localNotes = getLocalNotes(cleanUser);
-                const keywords = Object.keys(localNotes);
+                let keywordsSet = new Set(Object.keys(localNotes));
+                
+                // Fetch from Cloud too
+                const db = initFirebase();
+                if (db && isCloudHealthy) {
+                    try {
+                        const query = await db.collection("vault")
+                            .where("sender", "==", cleanUser)
+                            .get();
+                        query.forEach(doc => {
+                            const data = doc.data();
+                            if (data.keyword) keywordsSet.add(data.keyword);
+                        });
+                    } catch (e) { addLog(`Firebase vault list failed: ${e}`); }
+                }
+                
+                const keywords = Array.from(keywordsSet);
                 
                 if (keywords.length > 0) {
-                    let responseText = "📂 *DAFTAR NOTE ANDA*\n\n";
-                    keywords.forEach(kw => {
-                        const icon = localNotes[kw].type === 'note' ? '📝' : '📁';
-                        responseText += `${icon} *${kw}*\n`;
+                    let responseText = "📂 *DAFTAR NOTE ANDA (Cloud Sync)*\n\n";
+                    keywords.sort().forEach(kw => {
+                        const isLocal = !!localNotes[kw];
+                        const icon = (localNotes[kw]?.type === 'note' || !isLocal) ? '📝' : '📁';
+                        responseText += `${icon} *${kw}* ${isLocal ? '' : '☁️'}\n`;
                     });
                     responseText += "\nKetik `!buka <nama>` untuk melihat isi.";
                     await sock.sendMessage(senderJid, { text: responseText });
@@ -2248,44 +2919,100 @@ async function connectToWhatsApp() {
                 continue;
             }
 
+            // --- PERINTAH STATUS ---
             if (lowerText === "!stats" && isFromAdmin) {
-                const db = initFirebase();
+                const uptime = process.uptime();
+                const days = Math.floor(uptime / (3600 * 24));
+                const hours = Math.floor((uptime % (3600 * 24)) / 3600);
+                const minutes = Math.floor((uptime % 3600) / 60);
+                
                 const stats = `📊 *BOT STATISTICS*
 • *Status:* Online ✅
-• *Admin:* ${cleanAdmin}
-• *Target Group:* ${targetGroupId ? 'Set' : 'Not Set'}
-• *Firestore:* ${db && isCloudHealthy ? 'Connected 🟢' : 'Disconnected/Local 🔴'}
-• *Uptime:* ${Math.floor(process.uptime() / 60)} minutes
-• *Platform:* AI Studio`;
+• *Cloud Firestore:* ${isCloudHealthy ? 'Connected 🟢' : 'Disconnected 🔴'}
+• *Messages Queued:* ${messageQueue.getQueueLength()} 
+• *Uptime:* ${days}d ${hours}h ${minutes}m
+• *Platform:* AI Studio Build`;
                 await sock.sendMessage(senderJid, { text: stats });
                 continue;
             }
 
-            if (lowerText === "!help" || lowerText === "!menu") {
-                let menu = `🤖 *WA BOT MENU*\n\n`;
-                menu += `📁 *Note/Vault:* (Semua User)\n`;
-                menu += `• \`!simpan <nama> <isi>\`: Simpan catatan\n`;
-                menu += `• \`!buka <nama>\`: Lihat catatan\n`;
-                menu += `• \`!listnote\`: Lihat semua nama catatan\n\n`;
-                menu += `✨ *AI Features:* (Semua User)\n`;
-                menu += `• Chat Langsung: Ketik apa saja di Japri untuk ngobrol dengan AI.\n\n`;
-                
-                if (isFromAdmin) {
-                    menu += `⚙️ *Admin Commands:*\n`;
-                    menu += `• \`!sync\`: Sinkron data dari Sheets\n`;
-                    menu += `• \`!map <alias> <row>\`: Edit mapping baris\n`;
-                    menu += `• \`!restart\`: Mulai ulang bot\n`;
-                    menu += `• \`!stats\`: Statistik bot\n`;
-                }
-                
-                await sock.sendMessage(senderJid, { text: menu });
-                continue;
-            }
-
+            // [REMOVED DUPLICATE HELP BLOCK]
+            
             if (lowerText === "!restart" && isFromAdmin) {
                 await sock.sendMessage(senderJid, { text: "🔄 Memulai ulang bot (Sesi tetap tersimpan)..." });
                 addLog("♻️ Restart command received from admin.");
                 process.exit(0); // Applet platform will auto-restart the container
+            }
+
+            if (lowerText === "!backup" && isFromAdmin) {
+                try {
+                    await sock.sendMessage(senderJid, { text: "📦 Sedang menyiapkan backup program... Mohon tunggu." });
+                    addLog("📦 Creating system backup (.zip)...");
+                    
+                    const zip = new AdmZip();
+                    const excludeFiles = [
+                        'node_modules', '.git', 'dist', 'wa.zip', 
+                        'auth_info_baileys', 'bot_sessions', '.next', 
+                        '.cache', '.npm', 'package-lock.json'
+                    ];
+
+                    const files = fs.readdirSync(process.cwd());
+                    for (const file of files) {
+                        if (excludeFiles.includes(file)) continue;
+                        
+                        const stats = fs.statSync(file);
+                        if (stats.isDirectory()) {
+                            zip.addLocalFolder(file, file);
+                        } else {
+                            zip.addLocalFile(file);
+                        }
+                    }
+
+                    const zipBuffer = zip.toBuffer();
+                    await sock.sendMessage(senderJid, { 
+                        document: zipBuffer, 
+                        mimetype: 'application/zip', 
+                        fileName: `wa-bot-backup-${new Date().toISOString().split('T')[0]}.zip`,
+                        caption: "✅ Backup system berhasil dibuat."
+                    });
+                    addLog("✅ Backup sent to admin via WhatsApp.");
+                } catch (e: any) {
+                    addLog(`❌ [BACKUP] Failed: ${e.message}`);
+                    await sock.sendMessage(senderJid, { text: `❌ Gagal membuat backup: ${e.message}` });
+                }
+                continue;
+            }
+
+            if (lowerText === "!clearlog" && isFromAdmin) {
+                addLog("🧹 Log cleared via WhatsApp command.");
+                await sock.sendMessage(senderJid, { text: "✅ Log dashboard telah dibersihkan." });
+                continue;
+            }
+
+            if (lowerText.startsWith("!broadcast ") && isFromAdmin) {
+                const broadcastMsg = text.substring(11).trim();
+                if (broadcastMsg && targetGroupId) {
+                    await sock.sendMessage(targetGroupId, { text: `📢 *PENGUMUMAN ADMIN*\n\n${broadcastMsg}` });
+                    await sock.sendMessage(senderJid, { text: "✅ Pesan telah disiarkan ke grup target." });
+                } else {
+                    await sock.sendMessage(senderJid, { text: "⚠️ Berikan pesan atau pastikan grup target sudah diatur." });
+                }
+                continue;
+            }
+
+            if (lowerText === "!debug" && isFromAdmin) {
+                const debugData = {
+                    connection: connectionStatus,
+                    uptime: process.uptime(),
+                    cloud: isCloudHealthy,
+                    admin: adminNumber,
+                    target: targetGroupId,
+                    sheet: targetSheetId,
+                    memory: process.memoryUsage().heapUsed / 1024 / 1024,
+                    platform: "AI Studio (Production Node)"
+                };
+                await sock.sendMessage(senderJid, { text: `*[ 🛠️ DEBUG DUMP ]*\n\n\`\`\`json\n${JSON.stringify(debugData, null, 2)}\n\`\`\`` });
+                continue;
             }
 
             // Filter Keamanan Utuh
@@ -2312,7 +3039,7 @@ async function connectToWhatsApp() {
                 const isTechnical = Object.keys(ROW_MAP).some(alias => firstLine.startsWith(alias));
                 
                 if (!isTechnical && !text.startsWith(".") && !text.startsWith("!")) { 
-                    processMessageWithAI(text).then(async (results) => {
+                    processMessageWithAI(text, quotedText).then(async (results) => {
                         if (Array.isArray(results) && results.length > 0) {
                             for (const res of results) {
                                 if (res.text) {
@@ -2370,7 +3097,8 @@ async function connectToWhatsApp() {
                                     // Selalu update status
                                     updateStatus({ [alias]: value });
 
-                                    let row = ROW_MAP[alias];
+                                    const isGeneric = ["mwh", "mwh:", "counter", "stand", "stand meter", "cnt", "nilai", "angka", "data", "val"].includes(alias.toLowerCase().trim());
+                                    let row = isGeneric ? null : ROW_MAP[alias];
                                     if (!row) {
                                         const smart = findBestAlias(alias, value);
                                         if (smart) {
@@ -2412,8 +3140,9 @@ async function connectToWhatsApp() {
                              // Selalu update status untuk data teknis apapun yang ditemukan
                              updateStatus({ [alias]: value });
                              
-                             // Jika ada di mapping, update ke sheet
-                             let row = ROW_MAP[alias];
+                             // Jika ada di mapping, update ke sheet (jika bukan alias generik)
+                             const isGeneric = ["mwh", "mwh:", "counter", "stand", "stand meter", "cnt", "nilai", "angka", "data", "val"].includes(alias.toLowerCase().trim());
+                             let row = isGeneric ? null : ROW_MAP[alias];
                              if (!row) {
                                  const smart = findBestAlias(alias, value);
                                  if (smart) {
@@ -2457,7 +3186,8 @@ async function connectToWhatsApp() {
                     const aliasRaw = match[1].trim().toLowerCase();
                     const value = match[2].trim();
                     
-                    let row = ROW_MAP[aliasRaw];
+                    const isGeneric = ["mwh", "mwh:", "counter", "stand", "stand meter", "cnt", "nilai", "angka", "data", "val"].includes(aliasRaw.toLowerCase().trim());
+                    let row = isGeneric ? null : ROW_MAP[aliasRaw];
                     let aliasFinal = aliasRaw;
                     
                     if (!row) {
@@ -2542,7 +3272,7 @@ async function connectToWhatsApp() {
 
             // 2. Jika ada yang gagal atau format tidak baku (narasi), gunakan AI
             addLog(`Executing AI Analysis for text: "${text.slice(0, 50)}..."`);
-            processMessageWithAI(text).then(async (results) => {
+            processMessageWithAI(text, quotedText).then(async (results) => {
                 addLog(`AI Result: ${JSON.stringify(results)}`);
                 if (Array.isArray(results) && results.length > 0) {
                     const statusUpdates: Record<string, string> = {};
@@ -2559,7 +3289,8 @@ async function connectToWhatsApp() {
                             statusUpdates[alias] = res.value; 
                             
                             // Coba mapping row dengan fallback
-                            let row = ROW_MAP[alias];
+                            const isGeneric = ["mwh", "mwh:", "counter", "stand", "stand meter", "cnt", "nilai", "angka", "data", "val"].includes(alias.toLowerCase().trim());
+                            let row = isGeneric ? null : ROW_MAP[alias];
                             
                             // --- SMART LOGIC: Fuzzy Matching (AI result) ---
                             if (!row) {
@@ -2617,27 +3348,62 @@ async function connectToWhatsApp() {
   });
 }
 
-    async function processMessageWithAI(text: string) {
-        addLog(`AI Processing: ${text}`);
+    async function processMessageWithAI(text: string, quotedText: string = "") {
+        addLog(`AI Processing: "${text}" | Quoted Context: "${quotedText}"`);
         
-        const prompt = `Kamu adalah sistem otomatisasi laporan operasional (Log-Cleaner) PLTGU Muara Karang Blok 1.
-Tugas: Mengekstrak kegiatan operasional dan nilai teknis dari chat WhatsApp.
+        // Build a highly-contextual structured prompting scheme
+        let prompt = `Kamu adalah sistem otomatisasi laporan operasional (Log-Cleaner) PLTGU Muara Karang Blok 1.
+Tugas utama kamu adalah mengekstrak kegiatan operasional dan nilai teknis dari chat WhatsApp untuk disimpan otomatis ke spreadsheet pemantauan.
 
-Pesan: "${text}"
+DIBAWAH INI ADALAH PESAN YANG AKAN DIPROSES:`;
 
-ATURAN OUTPUT (JSON ARRAY):
+        if (quotedText) {
+            prompt += `
+[KONTEKS PESAN YANG DIBALAS (QUOTED TEXT)]
+${quotedText}
+(Catatan: Gunakan konteks ini untuk melengkapi informasi yang tidak disebutkan di Pesan Utama. Misalnya, jika Pesan Utama hanya memuat angka-angka desimal tanpa nama variabel, tetapi dibalas dari pesan berlabel "Gtg1" atau "STG", maka angka desimal itu merujuk pada parameter di modul tersebut!)`;
+        }
+
+        prompt += `
+[PESAN UTAMA]
+${text}
+
+ATURAN OUTPUT (Wajib JSON ARRAY saja):
 1. KEGIATAN: {"time": "HH:mm", "text": "KALIMAT_FORMAL"}
 2. DATA TEKNIS: {"field": "ALIAS", "value": "ANGKA"}
 
-Panduan:
-- Jika ada "STG 123", ekstrak sebagai {"field": "STG", "value": "123"}.
-- Jika ada pesan jam, gunakan jam tersebut.
+PANDUAN EKSTRAKSI DENGAN DOMAIN KNOWLEDGE PLTGU MUARA KARANG BLOK 1:
+- Unit GTG dibagi menjadi 3 generator gas (GTG 1.1, GTG 1.2, GTG 1.3):
+  * GTG 1.1 (atau GTG 1 / G1):
+    - MWh Generator Lokal (Row 7) berkisar antara ~600,000 s/d 700,000+ (contoh: "626403,456", "625691"). Ekstrak sebagai {"field": "gtg1", "value": "ANGKA"}.
+    - UAT GTG 1 (Row 11) berkisar antara ~22,000 (contoh: "22575,244", "22571,7"). Ekstrak sebagai {"field": "uat1", "value": "ANGKA"}.
+  * GTG 1.2 (atau GTG 2 / G2):
+    - MWh Generator Lokal (Row 8) berkisar antara ~550,000 s/d 600,000+ (contoh: "572319"). Ekstrak sebagai {"field": "gtg2", "value": "ANGKA"}.
+    - UAT GTG 2 (Row 12) berkisar antara ~27,000 (contoh: "27103,6"). Ekstrak sebagai {"field": "uat2", "value": "ANGKA"}.
+  * GTG 1.3 (atau GTG 3 / G3):
+    - MWh Generator Lokal (Row 9) berkisar antara ~200,000 s/d 250,000+ (contoh: "223528"). Ekstrak sebagai {"field": "gtg3", "value": "ANGKA"}.
+    - UAT GTG 3 (Row 13) berkisar antara ~25,000 (contoh: "25800,9"). Ekstrak sebagai {"field": "uat3", "value": "ANGKA"}.
 
-Balas HANYA JSON array. Jika tidak ada yang relevan, balas [].`;
+- Jika Pesan Utama berupa angka-angka desimal tanpa label nama (misal: "22575,244" dan "626403,456") tetapi membalas/merujuk ke label "Gtg1" atau "Gtg 1.1", maka otomatis gunakan domain knowledge di atas untuk mencocokkan masing-masing angka ke field yang benar:
+  * Angka sekitar ~22 ribu -> "uat1" (Row 11)
+  * Angka sekitar ~626 ribu -> "gtg1" (Row 7)
+
+- Jika membalas/merujuk ke label "Gtg2" atau "Gtg 1.2":
+  * Angka sekitar ~27 ribu -> "uat2" (Row 12)
+  * Angka sekitar ~572 ribu -> "gtg2" (Row 8)
+
+- Jika membalas/merujuk ke label "Gtg3" atau "Gtg 1.3":
+  * Angka sekitar ~25 ribu -> "uat3" (Row 13)
+  * Angka sekitar ~223 ribu -> "gtg3" (Row 9)
+
+- Jika ada jam pada pesan, isi field "time" dengan format "HH:mm" (misal: "14:00"). Jika tidak ada jam eksplisit dalam Pesan Utama, gunakan jam dari Pesan Quoted jika relevan, atau kosongkan/isi "auto".
+- Selalu pisahkan desimal dengan tanda koma (',') atau titik ('.') sesuai aslinya, namun pertahankan format numerik yang bersih tanpa penambah huruf satuan (misal jangan menulis 'MW' atau 'MWh' di field value).
+
+Balas HANYA JSON array tersebut. Jangan memberikan penulisan teks penjelasan apa-apa di luar JSON array. Jika tidak ada data yang bisa diekstrak, kembalikan [].`;
 
     try {
       const response = await ai.models.generateContent({ 
-        model: "gemini-3-flash-preview",
+        model: "gemini-3.5-flash",
         contents: prompt,
         config: { 
             responseMimeType: "application/json",
@@ -2659,14 +3425,9 @@ Balas HANYA JSON array. Jika tidak ada yang relevan, balas [].`;
   const cellUpdateTimestamps: Record<string, number> = {};
 
   async function isCellEmpty(sheetId: string, sheetTitle: string, cellRange: string): Promise<boolean> {
-    const sheets = google.sheets({ version: "v4", auth });
     try {
-      const response = await sheets.spreadsheets.values.get({
-        spreadsheetId: sheetId,
-        range: `${sheetTitle}!${cellRange}`,
-      });
-      const values = response.data.values;
-      return !values || values.length === 0 || !values[0][0];
+      const val = await getCellValue(sheetId, sheetTitle, cellRange);
+      return !val || val.trim() === "";
     } catch (err) {
       return true;
     }

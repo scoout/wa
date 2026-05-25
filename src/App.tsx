@@ -3,10 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useEffect, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { io, Socket } from "socket.io-client";
 import { motion, AnimatePresence } from "motion/react";
-import { QrCode, MessageSquare, Signal, SignalLow, Power, Terminal, Settings, ShieldCheck, Brain, Key, X, FolderHeart, FileText, Download, Trash2, Image, Video, FileDigit, Copy, Check, Database, Save, RotateCcw, Plus, Search, AlertCircle } from "lucide-react";
+import { QrCode, MessageSquare, Signal, SignalLow, Power, Terminal, Settings, ShieldCheck, Brain, Key, X, FolderHeart, FileText, Download, Trash2, Image, Video, FileDigit, Copy, Check, Database, Save, RotateCcw, Plus, Search, AlertCircle, Cloud } from "lucide-react";
 import { GoogleGenAI } from "@google/genai";
 
 // Use lazy initialization or check for process.env safely
@@ -43,9 +43,21 @@ export default function App() {
 
   const fetchVault = () => {
     fetch("/api/vault")
-      .then(res => res.json())
-      .then(data => setVaultItems(data))
-      .catch(err => console.error("Failed to fetch vault:", err));
+      .then(res => {
+        if (!res.ok) throw new Error("Server error");
+        return res.json();
+      })
+      .then(data => {
+        if (Array.isArray(data)) {
+          setVaultItems(data);
+        } else {
+          setVaultItems([]);
+        }
+      })
+      .catch(err => {
+        console.error("Failed to fetch vault:", err);
+        setVaultItems([]);
+      });
   };
 
   const handleCopyCode = (code: string) => {
@@ -56,8 +68,15 @@ export default function App() {
 
   useEffect(() => {
     fetch("/api/mapping")
-      .then(res => res.json())
-      .then(data => setMapping(data))
+      .then(res => {
+        if (!res.ok) throw new Error("Server error");
+        return res.json();
+      })
+      .then(data => {
+        if (data && typeof data === 'object' && !data.error) {
+          setMapping(data);
+        }
+      })
       .catch(err => console.error("Failed to fetch mapping:", err));
   }, []);
 
@@ -114,8 +133,15 @@ export default function App() {
   useEffect(() => {
     const checkApi = () => {
       fetch("/api/api-status")
-        .then(res => res.json())
-        .then(data => setApiStatus(data))
+        .then(res => {
+          if (!res.ok) throw new Error("Server error");
+          return res.json();
+        })
+        .then(data => {
+          if (data && !data.error) {
+            setApiStatus(data);
+          }
+        })
         .catch(() => {});
     };
     checkApi();
@@ -1080,7 +1106,7 @@ export default function App() {
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 md:gap-6">
-                {vaultItems.length === 0 ? (
+                {!Array.isArray(vaultItems) || vaultItems.length === 0 ? (
                   <div className="col-span-full py-32 flex flex-col items-center justify-center bg-zinc-900/50 rounded-3xl border-2 border-dashed border-zinc-800">
                     <FolderHeart size={64} className="text-zinc-800 mb-6" />
                     <h3 className="text-lg font-medium text-zinc-400">Vault Masih Kosong</h3>
@@ -1144,15 +1170,26 @@ export default function App() {
                         <p className="text-xs text-zinc-500 italic line-clamp-3 mb-6 bg-zinc-950/50 p-3 rounded-lg border border-zinc-800">
                           {item.type === 'note' ? item.content : `Pengirim: ${item.sender}`}
                         </p>
+                        <div className="flex flex-col gap-2">
+                             {item.driveLink && (
+                               <a 
+                                 href={item.driveLink} 
+                                 target="_blank" 
+                                 rel="noreferrer"
+                                 className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-bold py-2.5 rounded-lg flex items-center justify-center gap-2 transition-all shadow-lg shadow-emerald-600/10"
+                               >
+                                 <Cloud size={14} /> BUKA DI GOOGLE DRIVE
+                               </a>
+                             )}
                              <div className="flex gap-2">
                             {item.path ? (
                               <a 
-                                href={`/uploads/${item.path}`} 
+                                href={`/api/vault/download/${item.id}`} 
                                 target="_blank" 
                                 rel="noreferrer"
                                 className="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white text-[10px] font-bold py-2.5 rounded-lg flex items-center justify-center gap-2 transition-all shadow-lg shadow-indigo-600/10"
                               >
-                                <Download size={14} /> DOWNLOAD FILE
+                                <Download size={14} /> UNDUH FILE
                               </a>
                             ) : item.type === 'note' ? (
                               <button 
@@ -1168,11 +1205,12 @@ export default function App() {
                                 rel="noreferrer"
                                 className="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white text-[10px] font-bold py-2.5 rounded-lg flex items-center justify-center gap-2 transition-all shadow-lg shadow-indigo-600/10"
                               >
-                                <Download size={14} /> DOWNLOAD FILE
+                                <Download size={14} /> BUKA LINK
                               </a>
                             )}
+                            </div>
+                        </div>
                          </div>
-                      </div>
                     </motion.div>
                   ))
                 )}
