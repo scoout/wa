@@ -358,7 +358,7 @@ async function useMongoAuthState() {
                         const results = await collection.find({ _id: { $in: mongoIds as any } }).toArray();
                         results.forEach(res => {
                             const fullId = res._id.toString();
-                            const id = fullId.split("-").slice(1).join("-");
+                            const id = fullId.slice(type.length + 1);
                             const parsed = JSON.parse(res.data as string, BufferJSON.reviver);
                             data[id] = parsed;
                             memoryCache.set(fullId, parsed);
